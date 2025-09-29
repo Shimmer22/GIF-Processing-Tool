@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GIF 处理器</title>
+    <style>
+        body { font-family: sans-serif; background-color: #f4f4f9; color: #333; display: flex; flex-direction: column; align-items: center; }
+        h1 { color: #444; }
+        #upload-box { border: 2px dashed #ccc; border-radius: 10px; padding: 40px; text-align: center; cursor: pointer; background-color: #fff; transition: background-color 0.3s; width: 500px; margin-bottom: 20px;}
+        #upload-box.dragover { background-color: #e9e9ff; border-color: #9090ff; }
+        #file-input { display: none; }
+        #results { display: flex; flex-wrap: wrap; gap: 20px; justify-content: center; }
+        .preview-card { background-color: #fff; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); padding: 15px; text-align: center; }
+        .preview-card img { max-width: 240px; max-height: 240px; border: 1px solid #ddd; margin-bottom: 10px; }
+        .file-info { font-size: 0.9em; color: #555; margin-bottom: 10px; }
+        .file-info input { width: 90%; padding: 4px; border: 1px solid #ccc; border-radius: 4px; }
+        .controls button, .controls a { background-color: #007bff; color: white; border: none; padding: 8px 12px; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; margin: 0 5px; }
+        .controls button:hover, .controls a:hover { background-color: #0056b3; }
+        #spinner { display: none; font-size: 1.2em; }
+    </style>
+</head>
+<body>
+    <h1>GIF 处理器</h1>
+    
+    <div id="upload-box">
+        <p>拖拽GIF文件到这里，或点击选择</p>
+        <input type="file" id="file-input" accept="image/gif">
+    </div>
+
+    <div id="spinner">处理中...</div>
+
+    <div id="results"></div>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>
