@@ -49,7 +49,7 @@ app.mount("/processed", StaticFiles(directory=OUTPUT_DIR), name="processed")
 # --- 核心 GIF 处理逻辑 ---
 def process_gif(input_path: str, original_filename: str):
     """
-    处理单个GIF文件: resize, split, color convert, and save.
+    处理单个GIF文件: resize, split, and save, with robust transparency handling.
     返回一个包含处理后文件信息的字典列表。
     """
     try:
@@ -61,63 +61,52 @@ def process_gif(input_path: str, original_filename: str):
     width, height = original_image.size
     duration_s = get_gif_duration(original_image)
     
-    should_split = width == 2 * height
-
+    # --- 任务1: 准备要处理的帧列表 ---
     images_to_process = []
-    if should_split:
+    if width == 2 * height: # 分割
         left_box = (0, 0, width // 2, height)
         right_box = (width // 2, 0, width, height)
         
-        left_frames = [frame.convert("RGBA").crop(left_box) for frame in ImageSequence.Iterator(original_image)]
-        right_frames = [frame.convert("RGBA").crop(right_box) for frame in ImageSequence.Iterator(original_image)]
-        
+        # 为分割后的左右部分准备帧
+        all_frames = [frame.convert("RGBA") for frame in ImageSequence.Iterator(original_image)]
         images_to_process.append({
-            'frames': left_frames, 
-            'suffix': 'left',
+            'frames': [frame.crop(left_box) for frame in all_frames],
             'default_filename': create_default_filename(filename_prefix, duration_s, 'left')
         })
         images_to_process.append({
-            'frames': right_frames, 
-            'suffix': 'right',
+            'frames': [frame.crop(right_box) for frame in all_frames],
             'default_filename': create_default_filename(filename_prefix, duration_s, 'right')
         })
-        
-    else:
-        frames = [frame.copy() for frame in ImageSequence.Iterator(original_image)]
+    else: # 不分割
         images_to_process.append({
-            'frames': frames, 
-            'suffix': '',
+            'frames': [frame.convert("RGBA") for frame in ImageSequence.Iterator(original_image)],
             'default_filename': create_default_filename(filename_prefix, duration_s)
         })
 
-    # --- 任务2: Resize, 颜色转换和保存 ---
+    # --- 任务2: Resize 和 保存 ---
     final_results = []
     
     # 从原始图像中提取元数据
     original_duration = original_image.info.get('duration', 100)
     loop = original_image.info.get('loop', 0)
-    transparency = original_image.info.get('transparency', None)
 
     for item in images_to_process:
-        processed_frames = []
-        for frame in item['frames']:
-            resized_frame = frame.resize((240, 240), Image.Resampling.LANCZOS)
-            quantized_frame = resized_frame.convert("RGB").quantize(colors=256, method=Image.Quantize.MEDIANCUT)
-            processed_frames.append(quantized_frame)
+        # 调整所有帧的尺寸
+        processed_frames = [frame.resize((240, 240), Image.Resampling.LANCZOS) for frame in item['frames']]
 
         # 为服务器端存储生成一个唯一的文件名
         server_filename = f"{uuid.uuid4()}.gif"
         output_path = os.path.join(OUTPUT_DIR, server_filename)
         
+        # Pillow在从RGBA帧保存为GIF时会自动处理调色板和透明度
         save_params = {
             'save_all': True,
             'append_images': processed_frames[1:],
-            'duration': original_duration, # 保持原始的帧时长
+            'duration': original_duration,
             'loop': loop,
             'optimize': False,
+            'disposal': 2  # 对于透明GIF至关重要，指示渲染器在渲染下一帧前清除当前帧
         }
-        if transparency is not None:
-            save_params['transparency'] = transparency
 
         processed_frames[0].save(output_path, **save_params)
         
@@ -176,30 +165,26 @@ async def flip_gif(filename: str):
     if not os.path.exists(filepath):
         raise HTTPException(status_code=404, detail="文件未找到。")
 
-    # 为了让翻转可以来回切换，我们直接读取当前文件进行操作
     try:
-        img = Image.open(filepath) # 直接读取当前文件
-        frames = []
-        for frame in ImageSequence.Iterator(img):
-            flipped_frame = frame.transpose(Image.FLIP_LEFT_RIGHT)
-            frames.append(flipped_frame)
+        img = Image.open(filepath)
         
-        # 提取元信息并保存
+        # 统一转换为RGBA处理，以正确保留透明度
+        frames = [frame.convert('RGBA') for frame in ImageSequence.Iterator(img)]
+        flipped_frames = [frame.transpose(Image.FLIP_LEFT_RIGHT) for frame in frames]
+        
         duration = img.info.get('duration', 100)
         loop = img.info.get('loop', 0)
-        transparency = img.info.get('transparency', None)
         
         save_params = {
             'save_all': True,
-            'append_images': frames[1:],
+            'append_images': flipped_frames[1:],
             'duration': duration,
             'loop': loop,
             'optimize': False,
+            'disposal': 2
         }
-        if transparency is not None:
-             save_params['transparency'] = transparency
         
-        frames[0].save(filepath, **save_params) # 覆盖写入当前文件
+        flipped_frames[0].save(filepath, **save_params)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"翻转失败: {e}")
@@ -220,16 +205,14 @@ async def swap_rgb_gif(filename: str, rgb_map: str):
     if len(rgb_map) != 3 or not all(c in 'rgb' for c in rgb_map.lower()) or len(set(rgb_map.lower())) != 3:
         raise HTTPException(status_code=400, detail="无效的RGB映射。它必须是'rgb'的排列组合, 例如 'gbr'。")
 
-    # All operations should be based on the original version of the processed file
     original_filepath = _ensure_original_exists(filepath)
 
-    # If the user selects 'rgb', it means they want to revert to the original state.
     if rgb_map.lower() == 'rgb':
         shutil.copy(original_filepath, filepath)
         return JSONResponse(content={"status": "success", "filename": filename})
 
     try:
-        img = Image.open(original_filepath) # Read from original
+        img = Image.open(original_filepath)
         frames = []
         
         source_channels = "RGB"
@@ -243,14 +226,10 @@ async def swap_rgb_gif(filename: str, rgb_map: str):
             swapped_channels = [channels[i] for i in channel_map_indices]
             
             swapped_frame = Image.merge("RGBA", (*swapped_channels, a))
-            
-            # Quantize back to a palette for GIF saving
-            quantized_frame = swapped_frame.convert("RGB").quantize(colors=256, method=Image.Quantize.MEDIANCUT)
-            frames.append(quantized_frame)
+            frames.append(swapped_frame)
         
         duration = img.info.get('duration', 100)
         loop = img.info.get('loop', 0)
-        transparency = img.info.get('transparency', None)
         
         save_params = {
             'save_all': True,
@@ -258,12 +237,10 @@ async def swap_rgb_gif(filename: str, rgb_map: str):
             'duration': duration,
             'loop': loop,
             'optimize': False,
+            'disposal': 2
         }
-        if transparency is not None:
-             save_params['transparency'] = transparency
-             save_params['disposal'] = 2 # Correctly handle transparency
         
-        frames[0].save(filepath, **save_params) # Overwrite the main file
+        frames[0].save(filepath, **save_params)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"RGB交换失败: {e}")
