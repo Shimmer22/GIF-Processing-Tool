@@ -8,19 +8,18 @@ from fastapi.staticfiles import StaticFiles
 
 
 # --- 新增的辅助函数 ---
-def get_gif_duration(image: Image.Image) -> float:
-    """通过累加所有帧的持续时间来计算GIF的总时长（秒）。"""
-    duration_ms = 0
-    frames = 0
+def get_gif_duration(image: Image.Image) -> tuple:
+    """通过累加所有帧的持续时间来计算GIF的总时长（秒），并返回每帧的时长列表。"""
+    frame_durations_ms = []
     for frame in ImageSequence.Iterator(image):
-        duration_ms += frame.info.get('duration', 100)
-        frames += 1
+        frame_durations_ms.append(frame.info.get('duration', 100))
     
     # 对于单帧图像，Pillow有时不会正确报告时长, 我们给一个默认值
-    if frames <= 1:
-        return round(image.info.get('duration', 100) / 1000.0, 2)
+    if not frame_durations_ms:
+        frame_durations_ms.append(image.info.get('duration', 100))
 
-    return round(duration_ms / 1000.0, 2)
+    total_duration_s = sum(frame_durations_ms) / 1000.0
+    return round(total_duration_s, 2), frame_durations_ms
 
 def create_default_filename(prefix: str, duration_s: float, suffix: str = "") -> str:
     """根据时长创建默认文件名，例如 'happy_1_5s.gif' 或 'happy_3s_left.gif'。"""
@@ -47,6 +46,18 @@ app.mount("/processed", StaticFiles(directory=OUTPUT_DIR), name="processed")
 
 
 # --- 核心 GIF 处理逻辑 ---
+def verify_frame_count(filepath: str, expected_frames: int):
+    """验证输出GIF的帧数是否与输入一致。"""
+    try:
+        img = Image.open(filepath)
+        actual_frames = sum(1 for _ in ImageSequence.Iterator(img))
+        if actual_frames != expected_frames:
+            print(f"警告: 预期 {expected_frames} 帧，实际 {actual_frames} 帧")
+        return actual_frames
+    except Exception as e:
+        print(f"警告: 无法验证文件 {filepath} 的帧数: {e}")
+        return 0
+
 def process_gif(input_path: str, original_filename: str):
     """
     处理单个GIF文件: resize, split, and save, with robust transparency handling.
@@ -59,16 +70,16 @@ def process_gif(input_path: str, original_filename: str):
 
     filename_prefix = os.path.splitext(original_filename)[0]
     width, height = original_image.size
-    duration_s = get_gif_duration(original_image)
+    duration_s, frame_durations = get_gif_duration(original_image)
     
     # --- 任务1: 准备要处理的帧列表 ---
     images_to_process = []
+    all_frames = [frame.convert("RGBA") for frame in ImageSequence.Iterator(original_image)]
+    
     if width == 2 * height: # 分割
         left_box = (0, 0, width // 2, height)
         right_box = (width // 2, 0, width, height)
         
-        # 为分割后的左右部分准备帧
-        all_frames = [frame.convert("RGBA") for frame in ImageSequence.Iterator(original_image)]
         images_to_process.append({
             'frames': [frame.crop(left_box) for frame in all_frames],
             'default_filename': create_default_filename(filename_prefix, duration_s, 'left')
@@ -79,36 +90,34 @@ def process_gif(input_path: str, original_filename: str):
         })
     else: # 不分割
         images_to_process.append({
-            'frames': [frame.convert("RGBA") for frame in ImageSequence.Iterator(original_image)],
+            'frames': all_frames,
             'default_filename': create_default_filename(filename_prefix, duration_s)
         })
 
     # --- 任务2: Resize 和 保存 ---
     final_results = []
     
-    # 从原始图像中提取元数据
-    original_duration = original_image.info.get('duration', 100)
     loop = original_image.info.get('loop', 0)
+    disposal = original_image.info.get('disposal', 2)
 
     for item in images_to_process:
-        # 调整所有帧的尺寸
         processed_frames = [frame.resize((240, 240), Image.Resampling.LANCZOS) for frame in item['frames']]
 
-        # 为服务器端存储生成一个唯一的文件名
         server_filename = f"{uuid.uuid4()}.gif"
         output_path = os.path.join(OUTPUT_DIR, server_filename)
         
-        # Pillow在从RGBA帧保存为GIF时会自动处理调色板和透明度
         save_params = {
             'save_all': True,
-            'append_images': processed_frames[1:],
-            'duration': original_duration,
+            'append_images': processed_frames[1:] if len(processed_frames) > 1 else [],
+            'duration': frame_durations,
             'loop': loop,
             'optimize': False,
-            'disposal': 2  # 对于透明GIF至关重要，指示渲染器在渲染下一帧前清除当前帧
+            'disposal': disposal
         }
 
-        processed_frames[0].save(output_path, **save_params)
+        if processed_frames:
+            processed_frames[0].save(output_path, **save_params)
+            verify_frame_count(output_path, len(item['frames']))
         
         final_results.append({
             "url": f"/processed/{server_filename}",
@@ -167,24 +176,24 @@ async def flip_gif(filename: str):
 
     try:
         img = Image.open(filepath)
-        
-        # 统一转换为RGBA处理，以正确保留透明度
+        _, frame_durations = get_gif_duration(img)
+        loop = img.info.get('loop', 0)
+        disposal = img.info.get('disposal', 2)
+
         frames = [frame.convert('RGBA') for frame in ImageSequence.Iterator(img)]
         flipped_frames = [frame.transpose(Image.FLIP_LEFT_RIGHT) for frame in frames]
         
-        duration = img.info.get('duration', 100)
-        loop = img.info.get('loop', 0)
-        
         save_params = {
             'save_all': True,
-            'append_images': flipped_frames[1:],
-            'duration': duration,
+            'append_images': flipped_frames[1:] if len(flipped_frames) > 1 else [],
+            'duration': frame_durations,
             'loop': loop,
             'optimize': False,
-            'disposal': 2
+            'disposal': disposal
         }
         
-        flipped_frames[0].save(filepath, **save_params)
+        if flipped_frames:
+            flipped_frames[0].save(filepath, **save_params)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"翻转失败: {e}")
@@ -213,8 +222,11 @@ async def swap_rgb_gif(filename: str, rgb_map: str):
 
     try:
         img = Image.open(original_filepath)
-        frames = []
+        _, frame_durations = get_gif_duration(img)
+        loop = img.info.get('loop', 0)
+        disposal = img.info.get('disposal', 2)
         
+        frames = []
         source_channels = "RGB"
         channel_map_indices = [source_channels.find(c.upper()) for c in rgb_map]
 
@@ -228,19 +240,17 @@ async def swap_rgb_gif(filename: str, rgb_map: str):
             swapped_frame = Image.merge("RGBA", (*swapped_channels, a))
             frames.append(swapped_frame)
         
-        duration = img.info.get('duration', 100)
-        loop = img.info.get('loop', 0)
-        
         save_params = {
             'save_all': True,
-            'append_images': frames[1:],
-            'duration': duration,
+            'append_images': frames[1:] if len(frames) > 1 else [],
+            'duration': frame_durations,
             'loop': loop,
             'optimize': False,
-            'disposal': 2
+            'disposal': disposal
         }
         
-        frames[0].save(filepath, **save_params)
+        if frames:
+            frames[0].save(filepath, **save_params)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"RGB交换失败: {e}")
@@ -251,5 +261,5 @@ async def swap_rgb_gif(filename: str, rgb_map: str):
 # --- 运行服务器 ---
 if __name__ == "__main__":
     import uvicorn
-    print("服务器启动于 http://127.0.0.1:8000")
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    print("服务器启动于 http://127.0.0.1:28000")
+    uvicorn.run(app, host="127.0.0.1", port=28000)
